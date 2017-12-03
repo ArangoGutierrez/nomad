@@ -23,12 +23,13 @@ var (
 	// BuiltinDrivers contains the built in registered drivers
 	// which are available for allocation handling
 	BuiltinDrivers = map[string]Factory{
-		"docker":   NewDockerDriver,
-		"exec":     NewExecDriver,
-		"raw_exec": NewRawExecDriver,
-		"java":     NewJavaDriver,
-		"qemu":     NewQemuDriver,
-		"rkt":      NewRktDriver,
+		"docker":      NewDockerDriver,
+		"exec":        NewExecDriver,
+		"raw_exec":    NewRawExecDriver,
+		"java":        NewJavaDriver,
+		"qemu":        NewQemuDriver,
+		"rkt":         NewRktDriver,
+		"singularity": NewSingularityDriver,
 	}
 
 	// DriverStatsNotImplemented is the error to be returned if a driver doesn't
