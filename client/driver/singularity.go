@@ -17,7 +17,7 @@ import (
 	"time"
 
 	sclient "github.com/singularityware/singularity-go/cli"
-	"github.com/singularityware/singularity-go/pkg/types"
+	stypes "github.com/singularityware/singularity-go/pkg/types"
 
 	"github.com/hashicorp/go-plugin"
 	"github.com/hashicorp/nomad/client/allocdir"
@@ -160,7 +160,7 @@ type singularityPID struct {
 }
 
 // Retrieve instance status for the pod with the given UUID.
-func singularityGetStatus(instanceName string) (*types.Instance, error) {
+func singularityGetStatus(instanceName string) (*stypes.Instance, error) {
 	statusArgs := []string{
 		"instance.list",
 	}
@@ -443,24 +443,25 @@ func (s *SingularityDriver) Start(ctx *ExecContext, task *structs.Task) (*StartR
 	return &StartResponse{Handle: h}, nil
 }
 
-func (d *SingularityDriver) Cleanup(*ExecContext, *CreatedResources) error { return nil }
+func (s *SingularityDriver) Cleanup(*ExecContext, *CreatedResources) error { return nil }
 
-func (d *SingularityDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, error) {
+func (s *SingularityDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, error) {
 	// Parse the handle
-	pidBytes := []byte(strings.TrimPrefix(handleID, "Rkt:"))
-	id := &rktPID{}
+	pidBytes := []byte(strings.TrimPrefix(handleID, "singularity:"))
+	id := &singularityPID{}
 	if err := json.Unmarshal(pidBytes, id); err != nil {
-		return nil, fmt.Errorf("failed to parse Rkt handle '%s': %v", handleID, err)
+		return nil, fmt.Errorf("failed to parse Singularity handle '%s': %v", handleID, err)
 	}
 
 	pluginConfig := &plugin.ClientConfig{
 		Reattach: id.PluginConfig.PluginConfig(),
 	}
-	exec, pluginClient, err := createExecutorWithConfig(pluginConfig, d.config.LogOutput)
+
+	exec, pluginClient, err := createExecutorWithConfig(pluginConfig, s.config.LogOutput)
 	if err != nil {
-		d.logger.Println("[ERR] driver.rkt: error connecting to plugin so destroying plugin pid and user pid")
+		s.logger.Println("[ERR] driver.singularity: error connecting to plugin so destroying plugin pid and user pid")
 		if e := destroyPlugin(id.PluginConfig.Pid, id.ExecutorPid); e != nil {
-			d.logger.Printf("[ERR] driver.rkt: error destroying plugin and executor pid: %v", e)
+			s.logger.Printf("[ERR] driver.singularity: error destroying plugin and executor pid: %v", e)
 		}
 		return nil, fmt.Errorf("error connecting to plugin: %v", err)
 	}
@@ -468,15 +469,14 @@ func (d *SingularityDriver) Open(ctx *ExecContext, handleID string) (DriverHandl
 	// The task's environment is set via --set-env flags in Start, but the rkt
 	// command itself needs an evironment with PATH set to find iptables.
 	eb := env.NewEmptyBuilder()
-	filter := strings.Split(d.config.ReadDefault("env.blacklist", config.DefaultEnvBlacklist), ",")
+	filter := strings.Split(s.config.ReadDefault("env.blacklist", config.DefaultEnvBlacklist), ",")
 	rktEnv := eb.SetHostEnvvars(filter).Build()
 
 	ver, _ := exec.Version()
-	d.logger.Printf("[DEBUG] driver.rkt: version of executor: %v", ver.Version)
+	s.logger.Printf("[DEBUG] driver.singularity: version of executor: %v", ver.Version)
 	// Return a driver handle
-	h := &rktHandle{
-		uuid:           id.UUID,
-		env:            rktEnv,
+	h := &singularityHandle{
+		env:            ctx.TaskEnv,
 		taskDir:        ctx.TaskDir,
 		pluginClient:   pluginClient,
 		executorPid:    id.ExecutorPid,
