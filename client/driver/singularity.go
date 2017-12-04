@@ -64,10 +64,8 @@ type SingularityDriver struct {
 
 type SingularityDriverConfig struct {
 	// Image config info
-	ImageName string `mapstructure:"image_name"` // Image name, <NAME>.img
-	ImagePath string `mapstructure:"image_path"` //	Image path, (Default /var/lib/singularity/img)
-	Command   string `mapstructure:"command"`
-
+	ImageName   string `mapstructure:"image_name"`   // Image name, <NAME>.img
+	ImagePath   string `mapstructure:"image_path"`   //	Image path, (Default /var/lib/singularity/img)
 	ImageFormat string `mapstructure:"image_format"` // Image name, <NAME>.<fmt>
 	//	CONTAINER FORMATS SUPPORTED
 	// *.sqsh SquashFS format.  Native to Singularity 2.4+
@@ -85,11 +83,10 @@ type SingularityDriverConfig struct {
 	// shub://*            A container hosted on Singularity Hub
 	// docker://*          A container hosted on Docker Hub
 
-	ImageSize int      `mapstructure:"image_size"` //Image size in MB
-	Args      []string `mapstructure:"args"`       // Command to exec within the container
+	Command string   `mapstructure:"command"`
+	Args    []string `mapstructure:"args"` // Command to exec within the container
 	// list of args for --insecure-options
-	Env             []string `mapstructure:"env"`
-	InsecureOptions []string `mapstructure:"insecure_options"`
+	Env []string `mapstructure:"env"`
 
 	App  string `mapstructure:"app"`  //	Run an app's runscript instead of the default one
 	Bind string `mapstructure:"bind"` //	<spec>	A user-bind path specification.  spec has the format
@@ -114,7 +111,7 @@ type SingularityDriverConfig struct {
 	Pid     bool   `mapstructure:"pid"`     //	Run container in a new PID namespace
 	Pwd     string `mapstructure:"pwd"`     //	Initial working directory for payload process inside
 	//	the container
-	Scratch string `mapstructure:"scrath"` //	<path> Include a scratch directory within the container that
+	Scratch string `mapstructure:"scratch"` //	<path> Include a scratch directory within the container that
 	//	is linked to a temporary dir (use -W to force location)
 	Userns bool `mapstructure:"user_ns"` //	Run container in a new user namespace (this allows
 	//	Singularity to run completely unprivileged on recent
@@ -219,6 +216,13 @@ func (s *SingularityDriver) Validate(config map[string]interface{}) error {
 				Type:     fields.TypeString,
 				Required: true,
 			},
+			"image_path": {
+				Type: fields.TypeString,
+			},
+			"image_format": {
+				Type:     fields.TypeString,
+				Required: true,
+			},
 			"command": {
 				Type:     fields.TypeString,
 				Required: true,
@@ -226,10 +230,58 @@ func (s *SingularityDriver) Validate(config map[string]interface{}) error {
 			"args": {
 				Type: fields.TypeArray,
 			},
-			"image_path": {
+			"env": {
+				Type: fields.TypeArray,
+			},
+			"insecure_options": {
+				Type: fields.TypeArray,
+			},
+			"app": {
 				Type: fields.TypeString,
 			},
-			"image_format": {
+			"bind": {
+				Type: fields.TypeString,
+			},
+			"contain": {
+				Type: fields.TypeBool,
+			},
+			"contain_all": {
+				Type: fields.TypeBool,
+			},
+			"clean_env": {
+				Type: fields.TypeBool,
+			},
+			"home": {
+				Type: fields.TypeString,
+			},
+			"ipc": {
+				Type: fields.TypeBool,
+			},
+			"net": {
+				Type: fields.TypeBool,
+			},
+			"nvidia": {
+				Type: fields.TypeBool,
+			},
+			"overlay": {
+				Type: fields.TypeString,
+			},
+			"pid": {
+				Type: fields.TypeBool,
+			},
+			"pwd": {
+				Type: fields.TypeString,
+			},
+			"scratch": {
+				Type: fields.TypeString,
+			},
+			"writable": {
+				Type: fields.TypeBool,
+			},
+			"user_ns": {
+				Type: fields.TypeBool,
+			},
+			"work_dir": {
 				Type: fields.TypeString,
 			},
 		},
@@ -276,19 +328,15 @@ func (s *SingularityDriver) Prestart(ctx *ExecContext, task *structs.Task) (*Pre
 	return nil, nil
 }
 
-// Run an existing Singularity image.
+// Start Run an existing Singularity image.
 func (s *SingularityDriver) Start(ctx *ExecContext, task *structs.Task) (*StartResponse, error) {
-	var driverConfig SingularityDriverConfig
-	// Global arguments given to both prepare and run-prepared
-	globalArgs := make([]string, 0, 50)
-	runArgs := make([]string, 0, 50)
+	var sdc SingularityDriverConfig
 
-	if err := mapstructure.WeakDecode(task.Config, &driverConfig); err != nil {
+	if err := mapstructure.WeakDecode(task.Config, &sdc); err != nil {
 		return nil, err
 	}
 
-	// Get the command to be ran
-	command := driverConfig.Command
+	command := sdc.Command
 	if err := validateCommand(command, "args"); err != nil {
 		return nil, err
 	}
@@ -309,96 +357,102 @@ func (s *SingularityDriver) Start(ctx *ExecContext, task *structs.Task) (*StartR
 		return nil, err
 	}
 
-	// Populate args
-	globalArgs = append(globalArgs, "-v")
-	globalArgs = append(globalArgs, "-d")
+	// Global arguments given to both prepare and run-prepared
+	runArgs := make([]string, 0, 50)
+	execArgs := make([]string, 0, 50)
 
-	runArgs = append(runArgs, globalArgs...)
-	runArgs = append(runArgs, driverConfig.Command)
-
-	if driverConfig.App != "" {
-		runArgs = append(runArgs, "--app"+" "+driverConfig.App)
+	image := stypes.ImageFmt{
+		Name:   sdc.ImageName,
+		Format: sdc.ImageFormat,
+		Path:   sdc.ImagePath,
 	}
 
-	if driverConfig.Bind != "" {
-		runArgs = append(runArgs, "--bind"+" "+driverConfig.Bind)
-	}
+	switch sdc.Command {
+	case "exec":
+		execOptions := stypes.ContainerRunOptions{
+			App:          sdc.App,
+			Bind:         sdc.Bind,
+			Contain:      sdc.Contain,
+			Containall:   sdc.Containall,
+			Cleanenv:     sdc.Cleanenv,
+			Home:         sdc.Home,
+			Ipc:          sdc.Ipc,
+			Net:          sdc.Net,
+			Nvidia:       sdc.Nvidia,
+			Overlay:      sdc.Overlay,
+			Pid:          sdc.Pid,
+			Pwd:          sdc.Pwd,
+			Scratch:      sdc.Scratch,
+			Userns:       sdc.Userns,
+			Workdir:      sdc.Workdir,
+			Writable:     sdc.Writable,
+			ContainerFmt: image,
+			Args:         sdc.Args,
+		}
+		execArgs, err = sclient.ContainerRunOptions(s.Client, execOptions, "exec")
+		if err != nil {
+			_ = fmt.Errorf("%v", err)
+			s.logger.Printf("[DEBUG] driver.singularity: Couldn't retrieve command & args for exec (not specified): %v", err)
+			return nil, err
+		}
+	case "run":
+		execOptions := stypes.ContainerRunOptions{
+			App:          sdc.App,
+			Bind:         sdc.Bind,
+			Contain:      sdc.Contain,
+			Containall:   sdc.Containall,
+			Cleanenv:     sdc.Cleanenv,
+			Home:         sdc.Home,
+			Ipc:          sdc.Ipc,
+			Net:          sdc.Net,
+			Nvidia:       sdc.Nvidia,
+			Overlay:      sdc.Overlay,
+			Pid:          sdc.Pid,
+			Pwd:          sdc.Pwd,
+			Scratch:      sdc.Scratch,
+			Userns:       sdc.Userns,
+			Workdir:      sdc.Workdir,
+			Writable:     sdc.Writable,
+			ContainerFmt: image,
+			Args:         sdc.Args,
+		}
 
-	if driverConfig.Contain {
-		runArgs = append(runArgs, "--contain")
-	}
-
-	if driverConfig.Containall {
-		runArgs = append(runArgs, "--containall")
-	}
-
-	if driverConfig.Cleanenv {
-		runArgs = append(runArgs, "--cleanenv")
-	}
-
-	if driverConfig.Home != "" {
-		runArgs = append(runArgs, "--home"+" "+driverConfig.Home)
-	}
-
-	if driverConfig.Ipc {
-		runArgs = append(runArgs, "--ipc")
-	}
-
-	if driverConfig.Net {
-		runArgs = append(runArgs, "--net")
-	}
-
-	if driverConfig.Nvidia {
-		runArgs = append(runArgs, "--nv")
-	}
-
-	if driverConfig.Overlay != "" {
-		runArgs = append(runArgs, "--overlay"+" "+driverConfig.Overlay)
-	}
-
-	if driverConfig.Pid {
-		runArgs = append(runArgs, "--pid")
-	}
-
-	if driverConfig.Pwd != "" {
-		runArgs = append(runArgs, "--pwd"+" "+driverConfig.Pwd)
-	}
-
-	if driverConfig.Scratch != "" {
-		runArgs = append(runArgs, "--scratch"+" "+driverConfig.Scratch)
-	}
-
-	if driverConfig.Userns {
-		runArgs = append(runArgs, "--userns")
-	}
-
-	if driverConfig.Workdir != "" {
-		runArgs = append(runArgs, "--workdir"+" "+driverConfig.Workdir)
-	}
-
-	if driverConfig.Writable {
-		runArgs = append(runArgs, "--writable")
-	}
-
-	switch driverConfig.ImageFormat {
-	case dir:
-		runArgs = append(runArgs, driverConfig.ImagePath)
-	case "instance", dckr, shub:
-		runArgs = append(runArgs, driverConfig.ImageFormat+"://"+driverConfig.ImageName)
-	case sqshFmt, imgFmt, tarFmt:
-		runArgs = append(runArgs, driverConfig.ImagePath+driverConfig.ImageName+"."+driverConfig.ImageFormat)
+		execArgs, err = sclient.ContainerRunOptions(s.Client, execOptions, "run")
+		if err != nil {
+			_ = fmt.Errorf("%v", err)
+			s.logger.Printf("[DEBUG] driver.singularity: Couldn't retrieve command & args for exec (not specified): %v", err)
+			return nil, err
+		}
+	case "instance.start":
+		istartOptions := &stypes.InstanceStartOptions{
+			Bind:         sdc.Bind,
+			Contain:      sdc.Contain,
+			Home:         sdc.Home,
+			Net:          sdc.Net,
+			Nvidia:       sdc.Nvidia,
+			Overlay:      sdc.Overlay,
+			Scratch:      sdc.Scratch,
+			Workdir:      sdc.Workdir,
+			Writable:     sdc.Writable,
+			ContainerFmt: image,
+		}
+		execArgs, err = sclient.InstanceStartOptions(s.Client, istartOptions)
+		if err != nil {
+			_ = fmt.Errorf("%v", err)
+			s.logger.Printf("[DEBUG] driver.singularity: Couldn't retrieve  command & args for instance.start (not specified): %v", err)
+			return nil, err
+		}
 	case "":
-		err = errors.New("Container Format not specified")
-		fmt.Errorf("%v", err)
-		s.logger.Printf("[DEBUG] driver.singularity: Couldn't retrieve container Format (not specified): %v", err)
+		err = errors.New("Command not specified")
+		_ = fmt.Errorf("%v", err)
+		s.logger.Printf("[DEBUG] driver.singularity: Couldn't retrieve command (not specified): %v", err)
 		return nil, err
 	}
 
-	if driverConfig.Args != nil {
-		runArgs = append(runArgs, driverConfig.Args...)
-	}
+	runArgs = append(runArgs, execArgs...)
+
 	// Singularity image
-	img := driverConfig.ImageName
+	img := sdc.ImageName
 
 	executorCtx := &executor.ExecutorContext{
 		TaskEnv: ctx.TaskEnv,
@@ -417,7 +471,8 @@ func (s *SingularityDriver) Start(ctx *ExecContext, task *structs.Task) (*StartR
 		Args: runArgs,
 		User: task.User,
 	}
-	ps, err := execCont.LaunchCmd(execCmd)
+
+	ps, err := exec.LaunchCmd(execCmd)
 	if err != nil {
 		pluginClient.Kill()
 		return nil, err
@@ -426,6 +481,7 @@ func (s *SingularityDriver) Start(ctx *ExecContext, task *structs.Task) (*StartR
 	s.logger.Printf("[DEBUG] driver.singularity: \nstarted container %q for task %q with: %v", img, s.taskName, runArgs)
 	maxKill := s.DriverContext.config.MaxKillTimeout
 	h := &singularityHandle{
+		version:        s.Client.ClientVersion(),
 		env:            ctx.TaskEnv,
 		taskDir:        ctx.TaskDir,
 		pluginClient:   pluginClient,
@@ -469,6 +525,7 @@ func (s *SingularityDriver) Open(ctx *ExecContext, handleID string) (DriverHandl
 	s.logger.Printf("[DEBUG] driver.singularity: version of executor: %v", ver.Version)
 	// Return a driver handle
 	h := &singularityHandle{
+		version:        s.Client.ClientVersion(),
 		env:            ctx.TaskEnv,
 		taskDir:        ctx.TaskDir,
 		pluginClient:   pluginClient,
@@ -487,7 +544,7 @@ func (s *SingularityDriver) Open(ctx *ExecContext, handleID string) (DriverHandl
 func (sh *singularityHandle) ID() string {
 	// Return a handle to the PID
 	pid := &singularityPID{
-		Version:        "2.4",
+		Version:        sh.version,
 		PluginConfig:   NewPluginReattachConfig(sh.pluginClient.ReattachConfig()),
 		KillTimeout:    sh.killTimeout,
 		MaxKillTimeout: sh.maxKillTimeout,
