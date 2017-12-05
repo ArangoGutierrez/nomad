@@ -11,16 +11,15 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"time"
 
 	sclient "github.com/singularityware/singularity-go/cli"
 	stypes "github.com/singularityware/singularity-go/pkg/types"
 
+	multierror "github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/go-plugin"
 	"github.com/hashicorp/nomad/client/allocdir"
 	"github.com/hashicorp/nomad/client/config"
-	"github.com/hashicorp/nomad/client/driver/env"
 	"github.com/hashicorp/nomad/client/driver/executor"
 	dstructs "github.com/hashicorp/nomad/client/driver/structs"
 	cstructs "github.com/hashicorp/nomad/client/structs"
@@ -43,7 +42,7 @@ const (
 	// Singularity driver
 	singularityDriverAttr = "driver.singularity"
 
-	// rktCmd is the command rkt is installed as.
+	// SingularityCmd is the command singularity is installed as.
 	singularityCmd = "singularity"
 
 	dir                           = "directory"
@@ -125,28 +124,28 @@ type SingularityDriverConfig struct {
 
 // singularityHandle is returned from Start/Open as a handle to the PID
 type singularityHandle struct {
-	version        string
-	userPid        int
-	env            *env.TaskEnv
-	taskDir        *allocdir.TaskDir
-	pluginClient   *plugin.Client
-	executorPid    int
-	executor       executor.Executor
-	logger         *log.Logger
-	killTimeout    time.Duration
-	maxKillTimeout time.Duration
-	waitCh         chan *dstructs.WaitResult
-	doneCh         chan struct{}
+	pluginClient    *plugin.Client
+	executor        executor.Executor
+	isolationConfig *dstructs.IsolationConfig
+	userPid         int
+	taskDir         *allocdir.TaskDir
+	killTimeout     time.Duration
+	maxKillTimeout  time.Duration
+	logger          *log.Logger
+	waitCh          chan *dstructs.WaitResult
+	doneCh          chan struct{}
+	version         string
 }
 
 // singularityPID is a struct to map the pid running the process to the vm image on
 // disk
 type singularityPID struct {
-	Version        string
-	PluginConfig   *PluginReattachConfig
-	ExecutorPid    int
-	KillTimeout    time.Duration
-	MaxKillTimeout time.Duration
+	Version         string
+	KillTimeout     time.Duration
+	MaxKillTimeout  time.Duration
+	UserPid         int
+	IsolationConfig *dstructs.IsolationConfig
+	PluginConfig    *PluginReattachConfig
 }
 
 // Retrieve instance status for the pod with the given UUID.
@@ -330,30 +329,10 @@ func (s *SingularityDriver) Prestart(ctx *ExecContext, task *structs.Task) (*Pre
 
 // Start Run an existing Singularity image.
 func (s *SingularityDriver) Start(ctx *ExecContext, task *structs.Task) (*StartResponse, error) {
-	var sdc SingularityDriverConfig
+	var driverConfig SingularityDriverConfig
+	var err error
 
-	if err := mapstructure.WeakDecode(task.Config, &sdc); err != nil {
-		return nil, err
-	}
-
-	command := sdc.Command
-	if err := validateCommand(command, "args"); err != nil {
-		return nil, err
-	}
-
-	pluginLogFile := filepath.Join(ctx.TaskDir.Dir, fmt.Sprintf("%s-executor.out", task.Name))
-	executorConfig := &dstructs.ExecutorConfig{
-		LogFile:  pluginLogFile,
-		LogLevel: s.config.LogLevel,
-	}
-
-	execCont, pluginClient, err := createExecutor(s.config.LogOutput, s.config, executorConfig)
-	if err != nil {
-		return nil, err
-	}
-
-	absPath, err := GetAbsolutePath(singularityCmd)
-	if err != nil {
+	if err := mapstructure.WeakDecode(task.Config, &driverConfig); err != nil {
 		return nil, err
 	}
 
@@ -362,32 +341,32 @@ func (s *SingularityDriver) Start(ctx *ExecContext, task *structs.Task) (*StartR
 	execArgs := make([]string, 0, 50)
 
 	image := stypes.ImageFmt{
-		Name:   sdc.ImageName,
-		Format: sdc.ImageFormat,
-		Path:   sdc.ImagePath,
+		Name:   driverConfig.ImageName,
+		Format: driverConfig.ImageFormat,
+		Path:   driverConfig.ImagePath,
 	}
 
-	switch sdc.Command {
+	switch driverConfig.Command {
 	case "exec":
 		execOptions := stypes.ContainerRunOptions{
-			App:          sdc.App,
-			Bind:         sdc.Bind,
-			Contain:      sdc.Contain,
-			Containall:   sdc.Containall,
-			Cleanenv:     sdc.Cleanenv,
-			Home:         sdc.Home,
-			Ipc:          sdc.Ipc,
-			Net:          sdc.Net,
-			Nvidia:       sdc.Nvidia,
-			Overlay:      sdc.Overlay,
-			Pid:          sdc.Pid,
-			Pwd:          sdc.Pwd,
-			Scratch:      sdc.Scratch,
-			Userns:       sdc.Userns,
-			Workdir:      sdc.Workdir,
-			Writable:     sdc.Writable,
+			App:          driverConfig.App,
+			Bind:         driverConfig.Bind,
+			Contain:      driverConfig.Contain,
+			Containall:   driverConfig.Containall,
+			Cleanenv:     driverConfig.Cleanenv,
+			Home:         driverConfig.Home,
+			Ipc:          driverConfig.Ipc,
+			Net:          driverConfig.Net,
+			Nvidia:       driverConfig.Nvidia,
+			Overlay:      driverConfig.Overlay,
+			Pid:          driverConfig.Pid,
+			Pwd:          driverConfig.Pwd,
+			Scratch:      driverConfig.Scratch,
+			Userns:       driverConfig.Userns,
+			Workdir:      driverConfig.Workdir,
+			Writable:     driverConfig.Writable,
 			ContainerFmt: image,
-			Args:         sdc.Args,
+			Args:         driverConfig.Args,
 		}
 		execArgs, err = sclient.ContainerRunOptions(s.Client, execOptions, "exec")
 		if err != nil {
@@ -397,24 +376,24 @@ func (s *SingularityDriver) Start(ctx *ExecContext, task *structs.Task) (*StartR
 		}
 	case "run":
 		execOptions := stypes.ContainerRunOptions{
-			App:          sdc.App,
-			Bind:         sdc.Bind,
-			Contain:      sdc.Contain,
-			Containall:   sdc.Containall,
-			Cleanenv:     sdc.Cleanenv,
-			Home:         sdc.Home,
-			Ipc:          sdc.Ipc,
-			Net:          sdc.Net,
-			Nvidia:       sdc.Nvidia,
-			Overlay:      sdc.Overlay,
-			Pid:          sdc.Pid,
-			Pwd:          sdc.Pwd,
-			Scratch:      sdc.Scratch,
-			Userns:       sdc.Userns,
-			Workdir:      sdc.Workdir,
-			Writable:     sdc.Writable,
+			App:          driverConfig.App,
+			Bind:         driverConfig.Bind,
+			Contain:      driverConfig.Contain,
+			Containall:   driverConfig.Containall,
+			Cleanenv:     driverConfig.Cleanenv,
+			Home:         driverConfig.Home,
+			Ipc:          driverConfig.Ipc,
+			Net:          driverConfig.Net,
+			Nvidia:       driverConfig.Nvidia,
+			Overlay:      driverConfig.Overlay,
+			Pid:          driverConfig.Pid,
+			Pwd:          driverConfig.Pwd,
+			Scratch:      driverConfig.Scratch,
+			Userns:       driverConfig.Userns,
+			Workdir:      driverConfig.Workdir,
+			Writable:     driverConfig.Writable,
 			ContainerFmt: image,
-			Args:         sdc.Args,
+			Args:         driverConfig.Args,
 		}
 
 		execArgs, err = sclient.ContainerRunOptions(s.Client, execOptions, "run")
@@ -425,15 +404,15 @@ func (s *SingularityDriver) Start(ctx *ExecContext, task *structs.Task) (*StartR
 		}
 	case "instance.start":
 		istartOptions := &stypes.InstanceStartOptions{
-			Bind:         sdc.Bind,
-			Contain:      sdc.Contain,
-			Home:         sdc.Home,
-			Net:          sdc.Net,
-			Nvidia:       sdc.Nvidia,
-			Overlay:      sdc.Overlay,
-			Scratch:      sdc.Scratch,
-			Workdir:      sdc.Workdir,
-			Writable:     sdc.Writable,
+			Bind:         driverConfig.Bind,
+			Contain:      driverConfig.Contain,
+			Home:         driverConfig.Home,
+			Net:          driverConfig.Net,
+			Nvidia:       driverConfig.Nvidia,
+			Overlay:      driverConfig.Overlay,
+			Scratch:      driverConfig.Scratch,
+			Workdir:      driverConfig.Workdir,
+			Writable:     driverConfig.Writable,
 			ContainerFmt: image,
 		}
 		execArgs, err = sclient.InstanceStartOptions(s.Client, istartOptions)
@@ -451,25 +430,45 @@ func (s *SingularityDriver) Start(ctx *ExecContext, task *structs.Task) (*StartR
 
 	runArgs = append(runArgs, execArgs...)
 
+	// Get the command to be ran
+	command := driverConfig.Command
+	if err := validateCommand(command, "args"); err != nil {
+		return nil, err
+	}
+
+	pluginLogFile := filepath.Join(ctx.TaskDir.Dir, "executor.out")
+	executorConfig := &dstructs.ExecutorConfig{
+		LogFile:  pluginLogFile,
+		LogLevel: s.config.LogLevel,
+	}
+
+	exec, pluginClient, err := createExecutor(s.config.LogOutput, s.config, executorConfig)
+	if err != nil {
+		return nil, err
+	}
+
 	// Singularity image
-	img := sdc.ImageName
+	img := driverConfig.ImageName
 
 	executorCtx := &executor.ExecutorContext{
 		TaskEnv: ctx.TaskEnv,
 		Driver:  "singularity",
-		Task:    task,
-		TaskDir: ctx.TaskDir.Dir,
+		AllocID: s.DriverContext.allocID,
 		LogDir:  ctx.TaskDir.LogDir,
+		TaskDir: ctx.TaskDir.Dir,
+		Task:    task,
 	}
-	if err := execCont.SetContext(executorCtx); err != nil {
+	if err := exec.SetContext(executorCtx); err != nil {
 		pluginClient.Kill()
 		return nil, fmt.Errorf("failed to set executor context: %v", err)
 	}
 
 	execCmd := &executor.ExecCommand{
-		Cmd:  absPath,
-		Args: runArgs,
-		User: task.User,
+		Cmd:            singularityCmd,
+		Args:           runArgs,
+		FSIsolation:    true,
+		ResourceLimits: true,
+		User:           getExecutorUser(task),
 	}
 
 	ps, err := exec.LaunchCmd(execCmd)
@@ -479,19 +478,20 @@ func (s *SingularityDriver) Start(ctx *ExecContext, task *structs.Task) (*StartR
 	}
 
 	s.logger.Printf("[DEBUG] driver.singularity: \nstarted container %q for task %q with: %v", img, s.taskName, runArgs)
+	// Return a driver handle
 	maxKill := s.DriverContext.config.MaxKillTimeout
 	h := &singularityHandle{
-		version:        s.Client.ClientVersion(),
-		env:            ctx.TaskEnv,
-		taskDir:        ctx.TaskDir,
-		pluginClient:   pluginClient,
-		executor:       execCont,
-		executorPid:    ps.Pid,
-		logger:         s.logger,
-		killTimeout:    GetKillTimeout(task.KillTimeout, maxKill),
-		maxKillTimeout: maxKill,
-		doneCh:         make(chan struct{}),
-		waitCh:         make(chan *dstructs.WaitResult, 1),
+		pluginClient:    pluginClient,
+		userPid:         ps.Pid,
+		executor:        exec,
+		isolationConfig: ps.IsolationConfig,
+		killTimeout:     GetKillTimeout(task.KillTimeout, maxKill),
+		maxKillTimeout:  maxKill,
+		logger:          s.logger,
+		version:         s.config.Version.VersionNumber(),
+		doneCh:          make(chan struct{}),
+		waitCh:          make(chan *dstructs.WaitResult, 1),
+		taskDir:         ctx.TaskDir,
 	}
 
 	go h.run()
@@ -501,41 +501,46 @@ func (s *SingularityDriver) Start(ctx *ExecContext, task *structs.Task) (*StartR
 func (s *SingularityDriver) Cleanup(*ExecContext, *CreatedResources) error { return nil }
 
 func (s *SingularityDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, error) {
-	// Parse the handle
-	pidBytes := []byte(strings.TrimPrefix(handleID, "singularity:"))
-	id := &singularityPID{}
-	if err := json.Unmarshal(pidBytes, id); err != nil {
-		return nil, fmt.Errorf("failed to parse Singularity handle '%s': %v", handleID, err)
+	id := &execId{}
+	if err := json.Unmarshal([]byte(handleID), id); err != nil {
+		return nil, fmt.Errorf("Failed to parse handle '%s': %v", handleID, err)
 	}
 
 	pluginConfig := &plugin.ClientConfig{
 		Reattach: id.PluginConfig.PluginConfig(),
 	}
-
-	exec, pluginClient, err := createExecutorWithConfig(pluginConfig, s.config.LogOutput)
+	exec, client, err := createExecutorWithConfig(pluginConfig, s.config.LogOutput)
 	if err != nil {
-		s.logger.Println("[ERR] driver.singularity: error connecting to plugin so destroying plugin pid and user pid")
-		if e := destroyPlugin(id.PluginConfig.Pid, id.ExecutorPid); e != nil {
-			s.logger.Printf("[ERR] driver.singularity: error destroying plugin and executor pid: %v", e)
+		merrs := new(multierror.Error)
+		merrs.Errors = append(merrs.Errors, err)
+		s.logger.Println("[ERR] driver.exec: error connecting to plugin so destroying plugin pid and user pid")
+		if e := destroyPlugin(id.PluginConfig.Pid, id.UserPid); e != nil {
+			merrs.Errors = append(merrs.Errors, fmt.Errorf("error destroying plugin and userpid: %v", e))
 		}
-		return nil, fmt.Errorf("error connecting to plugin: %v", err)
+		if id.IsolationConfig != nil {
+			ePid := pluginConfig.Reattach.Pid
+			if e := executor.ClientCleanup(id.IsolationConfig, ePid); e != nil {
+				merrs.Errors = append(merrs.Errors, fmt.Errorf("destroying cgroup failed: %v", e))
+			}
+		}
+		return nil, fmt.Errorf("error connecting to plugin: %v", merrs.ErrorOrNil())
 	}
 
 	ver, _ := exec.Version()
-	s.logger.Printf("[DEBUG] driver.singularity: version of executor: %v", ver.Version)
+	s.logger.Printf("[DEBUG] driver.exec : version of executor: %v", ver.Version)
 	// Return a driver handle
 	h := &singularityHandle{
-		version:        s.Client.ClientVersion(),
-		env:            ctx.TaskEnv,
-		taskDir:        ctx.TaskDir,
-		pluginClient:   pluginClient,
-		executorPid:    id.ExecutorPid,
-		executor:       exec,
-		logger:         s.logger,
-		killTimeout:    id.KillTimeout,
-		maxKillTimeout: id.MaxKillTimeout,
-		doneCh:         make(chan struct{}),
-		waitCh:         make(chan *dstructs.WaitResult, 1),
+		pluginClient:    client,
+		executor:        exec,
+		userPid:         id.UserPid,
+		isolationConfig: id.IsolationConfig,
+		logger:          s.logger,
+		version:         id.Version,
+		killTimeout:     id.KillTimeout,
+		maxKillTimeout:  id.MaxKillTimeout,
+		doneCh:          make(chan struct{}),
+		waitCh:          make(chan *dstructs.WaitResult, 1),
+		taskDir:         ctx.TaskDir,
 	}
 	go h.run()
 	return h, nil
@@ -544,11 +549,12 @@ func (s *SingularityDriver) Open(ctx *ExecContext, handleID string) (DriverHandl
 func (sh *singularityHandle) ID() string {
 	// Return a handle to the PID
 	pid := &singularityPID{
-		Version:        sh.version,
-		PluginConfig:   NewPluginReattachConfig(sh.pluginClient.ReattachConfig()),
-		KillTimeout:    sh.killTimeout,
-		MaxKillTimeout: sh.maxKillTimeout,
-		ExecutorPid:    sh.executorPid,
+		Version:         sh.version,
+		KillTimeout:     sh.killTimeout,
+		MaxKillTimeout:  sh.maxKillTimeout,
+		PluginConfig:    NewPluginReattachConfig(sh.pluginClient.ReattachConfig()),
+		UserPid:         sh.userPid,
+		IsolationConfig: sh.isolationConfig,
 	}
 
 	data, err := json.Marshal(pid)
@@ -572,7 +578,12 @@ func (sh *singularityHandle) Update(task *structs.Task) error {
 }
 
 func (sh *singularityHandle) Exec(ctx context.Context, cmd string, args []string) ([]byte, int, error) {
-	return executor.ExecScript(ctx, sh.taskDir.Dir, sh.env, nil, singularityCmd, args)
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		// No deadline set on context; default to 1 minute
+		deadline = time.Now().Add(time.Minute)
+	}
+	return sh.executor.Exec(deadline, cmd, args)
 }
 
 func (sh *singularityHandle) Signal(s os.Signal) error {
