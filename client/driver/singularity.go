@@ -1,6 +1,7 @@
 package driver
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -11,6 +12,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	sclient "github.com/singularityware/singularity-go/cli"
@@ -41,7 +44,8 @@ const (
 	// The key populated in the Node Attributes to indicate the presence of the
 	// Singularity driver
 	singularityDriverAttr = "driver.singularity"
-
+	// singularityImageResKey is the CreatedResources key for singularity images
+	singularityImageResKey = "image"
 	// SingularityCmd is the command singularity is installed as.
 	singularityCmd = "singularity"
 
@@ -124,67 +128,133 @@ type SingularityDriverConfig struct {
 
 // singularityHandle is returned from Start/Open as a handle to the PID
 type singularityHandle struct {
-	pluginClient    *plugin.Client
-	executor        executor.Executor
-	isolationConfig *dstructs.IsolationConfig
-	userPid         int
-	taskDir         *allocdir.TaskDir
-	killTimeout     time.Duration
-	maxKillTimeout  time.Duration
-	logger          *log.Logger
-	waitCh          chan *dstructs.WaitResult
-	doneCh          chan struct{}
-	version         string
+	client         *sclient.Client
+	Image          string
+	containerID    string
+	pluginClient   *plugin.Client
+	executor       executor.Executor
+	taskDir        *allocdir.TaskDir
+	killTimeout    time.Duration
+	maxKillTimeout time.Duration
+	logger         *log.Logger
+	waitCh         chan *dstructs.WaitResult
+	doneCh         chan struct{}
+	version        string
 }
 
 // singularityPID is a struct to map the pid running the process to the vm image on
 // disk
 type singularityPID struct {
-	Version         string
-	KillTimeout     time.Duration
-	MaxKillTimeout  time.Duration
-	UserPid         int
-	IsolationConfig *dstructs.IsolationConfig
-	PluginConfig    *PluginReattachConfig
+	Version        string
+	KillTimeout    time.Duration
+	MaxKillTimeout time.Duration
+	PluginConfig   *PluginReattachConfig
+	Image          string
+	DaemonID       string
 }
 
-// Retrieve instance status for the pod with the given UUID.
-func singularityGetStatus(instanceName string) (*stypes.Instance, error) {
-	statusArgs := []string{
-		"instance.list",
+// Retrieve instance status
+func singularityGetStatus(instance stypes.Instance) (*stypes.Instance, error) {
+	// set the cmd to exec
+	out, err := exec.CommandContext(context.Background(), "singularity", "instance.list").Output()
+	if err != nil {
+		return nil, fmt.Errorf("No instances %s running", err)
 	}
 
-	var outBuf bytes.Buffer
-	cmd := exec.Command(singularityCmd, statusArgs...)
-	cmd.Stdout = &outBuf
-	cmd.Stderr = ioutil.Discard
+	r := bytes.NewReader(out)
 
-	if err := cmd.Run(); err != nil {
-		return nil, err
+	outputScanner := bufio.NewScanner(r)
+	containerPid := make(map[string]stypes.Instance)
+
+	for outputScanner.Scan() {
+		for outputScanner.Scan() {
+			fields := strings.Fields(outputScanner.Text())
+			pid, _ := strconv.Atoi(fields[1])
+			containerPid[fields[0]] = stypes.Instance{
+				DaemonName: fields[0],
+				PID:        pid,
+				Image: stypes.ImageFmt{
+					Name:   "",
+					Format: "instance",
+					Path:   fields[2],
+				},
+			}
+		}
 	}
 
-	var status stypes.Instance
-	if err := json.Unmarshal(outBuf.Bytes(), &status); err != nil {
-		return nil, err
+	if val, ok := containerPid[instance.DaemonName]; ok {
+		status := val
+		return &status, nil
 	}
 
-	return &status, nil
+	return nil, fmt.Errorf("No instance %s running", instance.DaemonName)
+}
+
+// Retrieve if a given image has an instance running
+func singularityImageInstance(image stypes.ImageFmt) (string, error) {
+	// set the cmd to exec
+	out, err := exec.CommandContext(context.Background(), "singularity", "instance.list").Output()
+	if err != nil {
+		return "", fmt.Errorf("No instances %s running", err)
+	}
+
+	r := bytes.NewReader(out)
+
+	outputScanner := bufio.NewScanner(r)
+	containerPid := make(map[string]stypes.Instance)
+
+	for outputScanner.Scan() {
+		for outputScanner.Scan() {
+			fields := strings.Fields(outputScanner.Text())
+			pid, _ := strconv.Atoi(fields[1])
+			containerPid[fields[0]] = stypes.Instance{
+				DaemonName: fields[0],
+				PID:        pid,
+				Image: stypes.ImageFmt{
+					Name:   "",
+					Format: "instance",
+					Path:   fields[2],
+				},
+			}
+		}
+	}
+
+	for k, _ := range containerPid {
+		if containerPid[k].Image.Name == image.Name {
+			return containerPid[k].DaemonName, nil
+		}
+	}
+
+	return "", fmt.Errorf("No instance running with image %s", image.Name)
 }
 
 // singularityRemove instance after it has exited.
 func singularityRemove(instanceName string) error {
 	errBuf := &bytes.Buffer{}
+
 	cmd := exec.Command(singularityCmd, "instance.stop", instanceName)
 	cmd.Stdout = ioutil.Discard
 	cmd.Stderr = errBuf
 	if err := cmd.Run(); err != nil {
 		if msg := errBuf.String(); len(msg) > 0 {
-			return fmt.Errorf("error removing pod %q: %s", instanceName, msg)
+			return fmt.Errorf("error stopping instance %q: %s", instanceName, msg)
 		}
 		return err
 	}
-
 	return nil
+}
+
+// imageExists returns whether the given image or directory
+// exists on path or not
+func imageExists(path string) bool {
+	_, err := os.Stat(path)
+	if err == nil {
+		return true
+	}
+	if os.IsNotExist(err) {
+		return false
+	}
+	return true
 }
 
 // NewSingularityDriver is used to create a new singularity driver
@@ -324,7 +394,42 @@ func (s *SingularityDriver) Periodic() (bool, time.Duration) {
 }
 
 func (s *SingularityDriver) Prestart(ctx *ExecContext, task *structs.Task) (*PrestartResponse, error) {
-	return nil, nil
+	var driverConfig SingularityDriverConfig
+	var err error
+
+	if err := mapstructure.WeakDecode(task.Config, &driverConfig); err != nil {
+		return nil, err
+	}
+
+	image := stypes.ImageFmt{
+		Name:   driverConfig.ImageName,
+		Format: driverConfig.ImageFormat,
+		Path:   driverConfig.ImagePath,
+	}
+
+	// Ensure the image is available if format != "instance", dckr, shub
+	resp := NewPrestartResponse()
+	switch image.Format {
+	case dir:
+		if imageExists(image.Path) {
+			resp.CreatedResources.Add(singularityImageResKey, image.Path)
+		} else {
+			return nil, fmt.Errorf("Image %s do not exist on path %s\n", image.Name, image.Path)
+		}
+	case "instance", dckr, shub:
+		resp.CreatedResources.Add(singularityImageResKey, image.Format)
+	case sqshFmt, imgFmt, tarFmt:
+		if imageExists(fmt.Sprintf("%s/%s", image.Path, image.Name)) {
+			resp.CreatedResources.Add(singularityImageResKey, fmt.Sprintf("%s/%s", image.Path, image.Name))
+		} else {
+			return nil, fmt.Errorf("Image %s do not exist on path %s\n", image.Name, image.Path)
+		}
+	case "":
+		err = errors.New("Container Format not specified")
+		return nil, err
+	}
+
+	return resp, nil
 }
 
 // Start Run an existing Singularity image.
@@ -338,97 +443,12 @@ func (s *SingularityDriver) Start(ctx *ExecContext, task *structs.Task) (*StartR
 
 	// Global arguments given to both prepare and run-prepared
 	runArgs := make([]string, 0, 50)
-	execArgs := make([]string, 0, 50)
 
 	image := stypes.ImageFmt{
 		Name:   driverConfig.ImageName,
 		Format: driverConfig.ImageFormat,
 		Path:   driverConfig.ImagePath,
 	}
-
-	switch driverConfig.Command {
-	case "exec":
-		execOptions := stypes.ContainerRunOptions{
-			App:          driverConfig.App,
-			Bind:         driverConfig.Bind,
-			Contain:      driverConfig.Contain,
-			Containall:   driverConfig.Containall,
-			Cleanenv:     driverConfig.Cleanenv,
-			Home:         driverConfig.Home,
-			Ipc:          driverConfig.Ipc,
-			Net:          driverConfig.Net,
-			Nvidia:       driverConfig.Nvidia,
-			Overlay:      driverConfig.Overlay,
-			Pid:          driverConfig.Pid,
-			Pwd:          driverConfig.Pwd,
-			Scratch:      driverConfig.Scratch,
-			Userns:       driverConfig.Userns,
-			Workdir:      driverConfig.Workdir,
-			Writable:     driverConfig.Writable,
-			ContainerFmt: image,
-			Args:         driverConfig.Args,
-		}
-		execArgs, err = sclient.ContainerRunOptions(s.Client, execOptions, "exec")
-		if err != nil {
-			_ = fmt.Errorf("%v", err)
-			s.logger.Printf("[DEBUG] driver.singularity: Couldn't retrieve command & args for exec (not specified): %v", err)
-			return nil, err
-		}
-	case "run":
-		execOptions := stypes.ContainerRunOptions{
-			App:          driverConfig.App,
-			Bind:         driverConfig.Bind,
-			Contain:      driverConfig.Contain,
-			Containall:   driverConfig.Containall,
-			Cleanenv:     driverConfig.Cleanenv,
-			Home:         driverConfig.Home,
-			Ipc:          driverConfig.Ipc,
-			Net:          driverConfig.Net,
-			Nvidia:       driverConfig.Nvidia,
-			Overlay:      driverConfig.Overlay,
-			Pid:          driverConfig.Pid,
-			Pwd:          driverConfig.Pwd,
-			Scratch:      driverConfig.Scratch,
-			Userns:       driverConfig.Userns,
-			Workdir:      driverConfig.Workdir,
-			Writable:     driverConfig.Writable,
-			ContainerFmt: image,
-			Args:         driverConfig.Args,
-		}
-
-		execArgs, err = sclient.ContainerRunOptions(s.Client, execOptions, "run")
-		if err != nil {
-			_ = fmt.Errorf("%v", err)
-			s.logger.Printf("[DEBUG] driver.singularity: Couldn't retrieve command & args for exec (not specified): %v", err)
-			return nil, err
-		}
-	case "instance.start":
-		istartOptions := &stypes.InstanceStartOptions{
-			Bind:         driverConfig.Bind,
-			Contain:      driverConfig.Contain,
-			Home:         driverConfig.Home,
-			Net:          driverConfig.Net,
-			Nvidia:       driverConfig.Nvidia,
-			Overlay:      driverConfig.Overlay,
-			Scratch:      driverConfig.Scratch,
-			Workdir:      driverConfig.Workdir,
-			Writable:     driverConfig.Writable,
-			ContainerFmt: image,
-		}
-		execArgs, err = sclient.InstanceStartOptions(s.Client, istartOptions)
-		if err != nil {
-			_ = fmt.Errorf("%v", err)
-			s.logger.Printf("[DEBUG] driver.singularity: Couldn't retrieve  command & args for instance.start (not specified): %v", err)
-			return nil, err
-		}
-	case "":
-		err = errors.New("Command not specified")
-		_ = fmt.Errorf("%v", err)
-		s.logger.Printf("[DEBUG] driver.singularity: Couldn't retrieve command (not specified): %v", err)
-		return nil, err
-	}
-
-	runArgs = append(runArgs, execArgs...)
 
 	// Get the command to be ran
 	command := driverConfig.Command
@@ -447,8 +467,36 @@ func (s *SingularityDriver) Start(ctx *ExecContext, task *structs.Task) (*StartR
 		return nil, err
 	}
 
-	// Singularity image
-	img := driverConfig.ImageName
+	// We don't need to start an instance if the instance is already running
+	// since we don't create instance which are already present on the host
+	// and are running
+	var daemonName string
+	if driverConfig.Command != "instance.start" {
+		daemonName, err = singularityImageInstance(image)
+		if err != nil {
+			// Start the instance
+			opt := stypes.InstanceStartOptions{
+				Bind:         driverConfig.Bind,
+				Contain:      driverConfig.Contain,
+				Home:         driverConfig.Home,
+				Net:          driverConfig.Net,
+				Nvidia:       driverConfig.Nvidia,
+				Overlay:      driverConfig.Overlay,
+				Scratch:      driverConfig.Scratch,
+				Workdir:      driverConfig.Workdir,
+				Writable:     driverConfig.Writable,
+				ContainerFmt: image,
+			}
+			if daemonName, err = s.Client.InstanceStart(context.Background(), opt); err != nil {
+				s.logger.Printf("[ERR] driver.singularity: failed to start instance\t%s: %s", daemonName, err)
+				pluginClient.Kill()
+				return nil, structs.NewRecoverableError(fmt.Errorf("Failed to start instance\t%s: %s", daemonName, err), structs.IsRecoverable(err))
+			}
+			s.logger.Printf("[DEBUG] driver.singularity: instance.start with Daemon name %s", daemonName)
+		} else {
+			s.logger.Printf("[DEBUG] driver.singularity: exec into instance %s", daemonName)
+		}
+	}
 
 	executorCtx := &executor.ExecutorContext{
 		TaskEnv: ctx.TaskEnv,
@@ -462,43 +510,138 @@ func (s *SingularityDriver) Start(ctx *ExecContext, task *structs.Task) (*StartR
 		pluginClient.Kill()
 		return nil, fmt.Errorf("failed to set executor context: %v", err)
 	}
+	///-----
+	switch driverConfig.Command {
+	case "exec":
+		execOptions := stypes.ContainerRunOptions{
+			App:        driverConfig.App,
+			Bind:       driverConfig.Bind,
+			Contain:    driverConfig.Contain,
+			Containall: driverConfig.Containall,
+			Cleanenv:   driverConfig.Cleanenv,
+			Home:       driverConfig.Home,
+			Ipc:        driverConfig.Ipc,
+			Net:        driverConfig.Net,
+			Nvidia:     driverConfig.Nvidia,
+			Overlay:    driverConfig.Overlay,
+			Pid:        driverConfig.Pid,
+			Pwd:        driverConfig.Pwd,
+			Scratch:    driverConfig.Scratch,
+			Userns:     driverConfig.Userns,
+			Workdir:    driverConfig.Workdir,
+			Writable:   driverConfig.Writable,
+			ContainerFmt: stypes.ImageFmt{
+				Name:   daemonName,
+				Format: "instance",
+				Path:   daemonName,
+			},
+			Args: driverConfig.Args,
+		}
+		_, err := sclient.ContainerRunOptions(s.Client, execOptions, "run")
+		if err != nil {
+			_ = fmt.Errorf("%v", err)
+			s.logger.Printf("[DEBUG] driver.singularity: Couldn't retrieve command & args for exec (not specified): %v", err)
+			return nil, err
+		}
+		_, err = s.Client.ContainerExec(context.Background(), execOptions)
+		if err != nil {
+			_ = fmt.Errorf("%v", err)
+			s.logger.Printf("[DEBUG] driver.singularity: Couldn't start instance: %v", err)
+			return nil, err
+		}
 
-	execCmd := &executor.ExecCommand{
-		Cmd:            singularityCmd,
-		Args:           runArgs,
-		FSIsolation:    true,
-		ResourceLimits: true,
-		User:           getExecutorUser(task),
-	}
-
-	ps, err := exec.LaunchCmd(execCmd)
-	if err != nil {
-		pluginClient.Kill()
+	case "run":
+		runOptions := stypes.ContainerRunOptions{
+			App:        driverConfig.App,
+			Bind:       driverConfig.Bind,
+			Contain:    driverConfig.Contain,
+			Containall: driverConfig.Containall,
+			Cleanenv:   driverConfig.Cleanenv,
+			Home:       driverConfig.Home,
+			Ipc:        driverConfig.Ipc,
+			Net:        driverConfig.Net,
+			Nvidia:     driverConfig.Nvidia,
+			Overlay:    driverConfig.Overlay,
+			Pid:        driverConfig.Pid,
+			Pwd:        driverConfig.Pwd,
+			Scratch:    driverConfig.Scratch,
+			Userns:     driverConfig.Userns,
+			Workdir:    driverConfig.Workdir,
+			Writable:   driverConfig.Writable,
+			ContainerFmt: stypes.ImageFmt{
+				Name:   daemonName,
+				Format: "instance",
+				Path:   daemonName,
+			},
+			Args: driverConfig.Args,
+		}
+		_, err := sclient.ContainerRunOptions(s.Client, runOptions, "run")
+		if err != nil {
+			_ = fmt.Errorf("%v", err)
+			s.logger.Printf("[DEBUG] driver.singularity: Couldn't retrieve command & args for exec (not specified): %v", err)
+			return nil, err
+		}
+		_, err = s.Client.ContainerRun(context.Background(), runOptions)
+		if err != nil {
+			_ = fmt.Errorf("%v", err)
+			s.logger.Printf("[DEBUG] driver.singularity: Couldn't start instance: %v", err)
+			return nil, err
+		}
+	case "instance.start":
+		istartOptions := stypes.InstanceStartOptions{
+			Bind:         driverConfig.Bind,
+			Contain:      driverConfig.Contain,
+			Home:         driverConfig.Home,
+			Net:          driverConfig.Net,
+			Nvidia:       driverConfig.Nvidia,
+			Overlay:      driverConfig.Overlay,
+			Scratch:      driverConfig.Scratch,
+			Workdir:      driverConfig.Workdir,
+			Writable:     driverConfig.Writable,
+			ContainerFmt: image,
+		}
+		_, err := sclient.InstanceStartOptions(s.Client, &istartOptions)
+		if err != nil {
+			_ = fmt.Errorf("%v", err)
+			s.logger.Printf("[DEBUG] driver.singularity: Couldn't retrieve  command & args for instance.start (not specified): %v", err)
+			return nil, err
+		}
+		_, err = s.Client.InstanceStart(context.Background(), istartOptions)
+		if err != nil {
+			_ = fmt.Errorf("%v", err)
+			s.logger.Printf("[DEBUG] driver.singularity: Couldn't start instance: %v", err)
+			return nil, err
+		}
+		s.logger.Printf("[DEBUG] driver.singularity: instance.start with Daemon name %s\n", istartOptions.InstanceName)
+	case "":
+		err = errors.New("Command not specified")
+		_ = fmt.Errorf("%v", err)
+		s.logger.Printf("[DEBUG] driver.singularity: Couldn't retrieve command (not specified): %v", err)
 		return nil, err
 	}
 
-	s.logger.Printf("[DEBUG] driver.singularity: \nstarted container %q for task %q with: %v", img, s.taskName, runArgs)
+	///-----
+
+	s.logger.Printf("[DEBUG] driver.singularity: \nstarted instance %s for task %q with: %v", daemonName, s.taskName, runArgs)
 	// Return a driver handle
 	maxKill := s.DriverContext.config.MaxKillTimeout
 	h := &singularityHandle{
-		pluginClient:    pluginClient,
-		userPid:         ps.Pid,
-		executor:        exec,
-		isolationConfig: ps.IsolationConfig,
-		killTimeout:     GetKillTimeout(task.KillTimeout, maxKill),
-		maxKillTimeout:  maxKill,
-		logger:          s.logger,
-		version:         s.config.Version.VersionNumber(),
-		doneCh:          make(chan struct{}),
-		waitCh:          make(chan *dstructs.WaitResult, 1),
-		taskDir:         ctx.TaskDir,
+		pluginClient:   pluginClient,
+		executor:       exec,
+		killTimeout:    GetKillTimeout(task.KillTimeout, maxKill),
+		maxKillTimeout: maxKill,
+		logger:         s.logger,
+		version:        s.config.Version.VersionNumber(),
+		doneCh:         make(chan struct{}),
+		waitCh:         make(chan *dstructs.WaitResult, 1),
+		taskDir:        ctx.TaskDir,
+		Image:          image.Name,
+		containerID:    daemonName,
 	}
 
 	go h.run()
 	return &StartResponse{Handle: h}, nil
 }
-
-func (s *SingularityDriver) Cleanup(*ExecContext, *CreatedResources) error { return nil }
 
 func (s *SingularityDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, error) {
 	id := &execId{}
@@ -513,7 +656,7 @@ func (s *SingularityDriver) Open(ctx *ExecContext, handleID string) (DriverHandl
 	if err != nil {
 		merrs := new(multierror.Error)
 		merrs.Errors = append(merrs.Errors, err)
-		s.logger.Println("[ERR] driver.exec: error connecting to plugin so destroying plugin pid and user pid")
+		s.logger.Println("[ERR] driver.singularity: error connecting to plugin so destroying plugin pid and user pid")
 		if e := destroyPlugin(id.PluginConfig.Pid, id.UserPid); e != nil {
 			merrs.Errors = append(merrs.Errors, fmt.Errorf("error destroying plugin and userpid: %v", e))
 		}
@@ -527,34 +670,34 @@ func (s *SingularityDriver) Open(ctx *ExecContext, handleID string) (DriverHandl
 	}
 
 	ver, _ := exec.Version()
-	s.logger.Printf("[DEBUG] driver.exec : version of executor: %v", ver.Version)
+	s.logger.Printf("[DEBUG] driver.singularity : version of executor: %v", ver.Version)
 	// Return a driver handle
 	h := &singularityHandle{
-		pluginClient:    client,
-		executor:        exec,
-		userPid:         id.UserPid,
-		isolationConfig: id.IsolationConfig,
-		logger:          s.logger,
-		version:         id.Version,
-		killTimeout:     id.KillTimeout,
-		maxKillTimeout:  id.MaxKillTimeout,
-		doneCh:          make(chan struct{}),
-		waitCh:          make(chan *dstructs.WaitResult, 1),
-		taskDir:         ctx.TaskDir,
+		pluginClient:   client,
+		executor:       exec,
+		logger:         s.logger,
+		version:        id.Version,
+		killTimeout:    id.KillTimeout,
+		maxKillTimeout: id.MaxKillTimeout,
+		doneCh:         make(chan struct{}),
+		waitCh:         make(chan *dstructs.WaitResult, 1),
+		taskDir:        ctx.TaskDir,
 	}
 	go h.run()
 	return h, nil
 }
 
+func (s *SingularityDriver) Cleanup(*ExecContext, *CreatedResources) error { return nil }
+
 func (sh *singularityHandle) ID() string {
 	// Return a handle to the PID
 	pid := &singularityPID{
-		Version:         sh.version,
-		KillTimeout:     sh.killTimeout,
-		MaxKillTimeout:  sh.maxKillTimeout,
-		PluginConfig:    NewPluginReattachConfig(sh.pluginClient.ReattachConfig()),
-		UserPid:         sh.userPid,
-		IsolationConfig: sh.isolationConfig,
+		Version:        sh.version,
+		KillTimeout:    sh.killTimeout,
+		MaxKillTimeout: sh.maxKillTimeout,
+		PluginConfig:   NewPluginReattachConfig(sh.pluginClient.ReattachConfig()),
+		Image:          sh.Image,
+		DaemonID:       sh.containerID,
 	}
 
 	data, err := json.Marshal(pid)
@@ -593,13 +736,14 @@ func (sh *singularityHandle) Signal(s os.Signal) error {
 // Kill is used to terminate the task. We send an Interrupt
 // and then provide a 5 second grace period before doing a Kill.
 func (sh *singularityHandle) Kill() error {
-	sh.executor.ShutDown()
-	select {
-	case <-sh.doneCh:
-		return nil
-	case <-time.After(sh.killTimeout):
-		return sh.executor.Exit()
+	options := stypes.InstanceStopOptions{
+		InstanceName: sh.containerID,
 	}
+	_, err := sh.client.InstanceStop(context.Background(), options)
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func (sh *singularityHandle) Stats() (*cstructs.TaskResourceUsage, error) {
@@ -610,7 +754,7 @@ func (sh *singularityHandle) run() {
 	ps, werr := sh.executor.Wait()
 	close(sh.doneCh)
 	if ps.ExitCode == 0 && werr != nil {
-		if e := killProcess(sh.userPid); e != nil {
+		if e := sh.Kill(); e != nil {
 			sh.logger.Printf("[ERR] driver.singularity: error killing user process: %v", e)
 		}
 	}
