@@ -15,7 +15,6 @@ import (
 	"github.com/hashicorp/consul/lib"
 	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/nomad/acl"
-	"github.com/hashicorp/nomad/client/driver"
 	"github.com/hashicorp/nomad/helper"
 	"github.com/hashicorp/nomad/helper/uuid"
 	"github.com/hashicorp/nomad/nomad/state"
@@ -1275,14 +1274,14 @@ func validateJob(job *structs.Job) (invalid, warnings error) {
 	warnings = job.Warnings()
 
 	// Get the signals required
-	signals := job.RequiredSignals()
+	//signals := job.RequiredSignals()
 
 	// Validate the driver configurations.
-	for _, tg := range job.TaskGroups {
+	/*for _, tg := range job.TaskGroups {
 		// Get the signals for the task group
 		tgSignals, tgOk := signals[tg.Name]
 
-		for _, task := range tg.Tasks {
+		/*for _, task := range tg.Tasks {
 			d, err := driver.NewDriver(
 				task.Driver,
 				driver.NewEmptyDriverContext(),
@@ -1313,7 +1312,7 @@ func validateJob(job *structs.Job) (invalid, warnings error) {
 				}
 			}
 		}
-	}
+	}*/
 
 	if job.Type == structs.JobTypeCore {
 		multierror.Append(validationErrors, fmt.Errorf("job type cannot be core"))

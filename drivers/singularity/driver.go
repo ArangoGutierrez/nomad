@@ -423,10 +423,10 @@ func (d *singularityDriver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHan
 		Cmd:            absPath,
 		Args:           runArgs,
 		ResourceLimits: false,
-		Resources: &executor.Resources{
-			CPU:      int(cfg.Resources.LinuxResources.CPUShares),
-			MemoryMB: int(drivers.BytesToMB(cfg.Resources.LinuxResources.MemoryLimitBytes)),
-			DiskMB:   cfg.Resources.NomadResources.DiskMB,
+		Resources:      &executor.Resources{
+			//CPU:      int(cfg.Resources.LinuxResources.CPUShares),
+			//MemoryMB: int(drivers.BytesToMB(cfg.Resources.LinuxResources.MemoryLimitBytes)),
+			//DiskMB:   cfg.Resources.NomadResources.DiskMB,
 		},
 		Env:        cfg.EnvList(),
 		TaskDir:    cfg.TaskDir().Dir,
